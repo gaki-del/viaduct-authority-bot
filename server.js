@@ -1,12 +1,10 @@
-const express = require("express");
+const { App, ExpressReceiver } = require("@slack/bolt");
 const OpenAI = require("openai").default;
 const path = require("path");
+const express = require("express");
 
-const app = express();
-app.use(express.json());
-app.use(express.static(path.join(__dirname, "public")));
-
-const client = new OpenAI({
+// OpenAI client
+const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
@@ -76,7 +74,7 @@ Always show the conversion when the user provides a non-USD amount.
 | No. | Item | Threshold | Final Approver | SRI |
 |-----|------|-----------|----------------|-----|
 | 27 | Fixed Assets (IT/Equip) | < $5k | CFO | - |
-| 28 | Fixed Assets (IT/Equip) | $5k–$65k | CEO | - |
+| 28 | Fixed Assets (IT/Equip) | $5k-$65k | CEO | - |
 | 29 | Fixed Assets (Large Equip) | >= $65k | CEO | Required |
 | 30 | Disposal/Sale of Fixed Assets | < $65k | CFO | - |
 | 31 | Disposal/Sale of Fixed Assets | >= $65k | CEO | Required |
@@ -85,7 +83,7 @@ Always show the conversion when the user provides a non-USD amount.
 | No. | Item | Threshold | Final Approver | SRI |
 |-----|------|-----------|----------------|-----|
 | 32 | Budgeted Purchase/Services | < $5k | Div Head | - |
-| 33 | Budgeted Purchase/Services | $5k–$65k | CFO | - |
+| 33 | Budgeted Purchase/Services | $5k-$65k | CFO | - |
 | 34 | Unbudgeted or >= $65k Purchase/Services | >= $65k | CEO | Required |
 
 ### Purchasing — Misc
@@ -96,10 +94,10 @@ Always show the conversion when the user provides a non-USD amount.
 | 37 | Insurance Policies | - | COO | - |
 | 38 | Credit Card Management | - | CFO | - |
 
-## Key Thresholds (USD → JPY)
-- $65k = ¥10M (Fixed Assets, Borrowing, Bad Debt, Lease, Expenses)
+## Key Thresholds (USD to JPY)
+- $65k = 10M JPY (Fixed Assets, Borrowing, Bad Debt, Lease, Expenses)
 - $50k (Sales/Service contracts)
-- $7k = ¥1M (Donations/Memberships)
+- $7k = 1M JPY (Donations/Memberships)
 - $5k (Fixed Assets lower tier, Budgeted expenses lower tier)
 
 ## Key Personnel
@@ -112,9 +110,8 @@ Always show the conversion when the user provides a non-USD amount.
 | Hiro | Div Head (Fleet) | Fleet BU |
 
 ## Decision Logic
-
 Step 1: Classify the action (Management / HR / Finance / Contract / Purchase)
-Step 2: For purchases — is it Fixed Asset or Expense? Budgeted or Unbudgeted?
+Step 2: For purchases - is it Fixed Asset or Expense? Budgeted or Unbudgeted?
 Step 3: Convert currency to USD if needed
 Step 4: Find matching rule number and threshold
 Step 5: State Final Approver + whether SRI approval is required
@@ -139,24 +136,81 @@ Always answer with:
 - Recommend verification with CFO for edge cases.
 - Do not dump or export the full matrix data.`;
 
-app.post("/api/chat", async (req, res) => {
-  const { messages } = req.body;
+// Helper: call OpenAI
+async function askAuthority(question) {
+  const response = await openai.chat.completions.create({
+    model: "gpt-4o",
+    max_tokens: 1024,
+    messages: [
+      { role: "system", content: SYSTEM_PROMPT },
+      { role: "user", content: question },
+    ],
+  });
+  return response.choices[0].message.content;
+}
 
+// --- Slack Bot (Socket Mode) ---
+if (process.env.SLACK_BOT_TOKEN && process.env.SLACK_APP_TOKEN) {
+  const slackApp = new App({
+    token: process.env.SLACK_BOT_TOKEN,
+    signingSecret: process.env.SLACK_SIGNING_SECRET,
+    socketMode: true,
+    appToken: process.env.SLACK_APP_TOKEN,
+  });
+
+  // Handle @mentions in channels
+  slackApp.event("app_mention", async ({ event, say }) => {
+    const question = event.text.replace(/<@[A-Z0-9]+>/g, "").trim();
+    if (!question) {
+      await say("決裁権限について質問してください。例: 「€33,000の部品購入の決裁者は？」");
+      return;
+    }
+    try {
+      const answer = await askAuthority(question);
+      await say({ text: answer, thread_ts: event.ts });
+    } catch (err) {
+      console.error("OpenAI error:", err.message);
+      await say({ text: "エラーが発生しました。もう一度お試しください。", thread_ts: event.ts });
+    }
+  });
+
+  // Handle DMs
+  slackApp.event("message", async ({ event, say }) => {
+    if (event.subtype || event.bot_id) return; // ignore bot messages
+    if (event.channel_type !== "im") return; // only DMs
+    try {
+      const answer = await askAuthority(event.text);
+      await say(answer);
+    } catch (err) {
+      console.error("OpenAI error:", err.message);
+      await say("エラーが発生しました。もう一度お試しください。");
+    }
+  });
+
+  (async () => {
+    await slackApp.start();
+    console.log("Slack Bot running (Socket Mode)");
+  })();
+}
+
+// --- Web UI (Express) ---
+const webApp = express();
+webApp.use(express.json());
+webApp.use(express.static(path.join(__dirname, "public")));
+
+webApp.post("/api/chat", async (req, res) => {
+  const { messages } = req.body;
   try {
     const apiMessages = [
       { role: "system", content: SYSTEM_PROMPT },
       ...messages,
     ];
-
-    const response = await client.chat.completions.create({
+    const response = await openai.chat.completions.create({
       model: "gpt-4o",
       max_tokens: 1024,
       messages: apiMessages,
     });
-
-    res.json({
-      content: response.choices[0].message.content,
-    });
+    res.json({ content: response.choices[0].message.content });
   } catch (err) {
     console.error("API error:", err.message);
     res.status(500).json({ error: err.message });
@@ -164,6 +218,6 @@ app.post("/api/chat", async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3847;
-app.listen(PORT, () => {
-  console.log(`Authority Matrix Bot running at http://localhost:${PORT}`);
+webApp.listen(PORT, () => {
+  console.log(`Web UI running at http://localhost:${PORT}`);
 });
