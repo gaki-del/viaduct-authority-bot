@@ -163,7 +163,7 @@ app.post("/api/chat", async (req, res) => {
   }
 });
 
-const PORT = 3847;
+const PORT = process.env.PORT || 3847;
 app.listen(PORT, () => {
   console.log(`Authority Matrix Bot running at http://localhost:${PORT}`);
 });
